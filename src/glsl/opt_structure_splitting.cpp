@@ -38,6 +38,8 @@
 #include "ir_rvalue_visitor.h"
 #include "glsl_types.h"
 
+namespace {
+
 static bool debug = false;
 
 // XXX using variable_entry2 here to avoid collision (MSVC multiply-defined
@@ -61,11 +63,15 @@ public:
    /** Number of times the variable is referenced, including assignments. */
    unsigned whole_structure_access;
 
-   bool declaration; /* If the variable had a decl in the instruction stream */
+   /* If the variable had a decl we can work with in the instruction
+    * stream.  We can't do splitting on function arguments, which
+    * don't get this variable set.
+    */
+   bool declaration;
 
    ir_variable **components;
 
-   /** hieralloc_parent(this->var) -- the shader's hieralloc context. */
+   /** ralloc_parent(this->var) -- the shader's ralloc context. */
    void *mem_ctx;
 };
 
@@ -74,13 +80,13 @@ class ir_structure_reference_visitor : public ir_hierarchical_visitor {
 public:
    ir_structure_reference_visitor(void)
    {
-      this->mem_ctx = hieralloc_new(NULL);
+      this->mem_ctx = ralloc_context(NULL);
       this->variable_list.make_empty();
    }
 
    ~ir_structure_reference_visitor(void)
    {
-      hieralloc_free(mem_ctx);
+      ralloc_free(mem_ctx);
    }
 
    virtual ir_visitor_status visit(ir_variable *);
@@ -151,6 +157,12 @@ ir_structure_reference_visitor::visit_enter(ir_dereference_record *ir)
 ir_visitor_status
 ir_structure_reference_visitor::visit_enter(ir_assignment *ir)
 {
+   /* If there are no structure references yet, no need to bother with
+    * processing the expression tree.
+    */
+   if (this->variable_list.is_empty())
+      return visit_continue_with_parent;
+
    if (ir->lhs->as_dereference_variable() &&
        ir->rhs->as_dereference_variable() &&
        !ir->condition) {
@@ -165,8 +177,9 @@ ir_structure_reference_visitor::visit_enter(ir_assignment *ir)
 ir_visitor_status
 ir_structure_reference_visitor::visit_enter(ir_function_signature *ir)
 {
-   /* We don't want to descend into the function parameters and
-    * dead-code eliminate them, so just accept the body here.
+   /* We don't have logic for structure-splitting function arguments,
+    * so just look at the body instructions and not the parameter
+    * declarations.
     */
    visit_list_elements(this, &ir->body);
    return visit_continue_with_parent;
@@ -190,7 +203,6 @@ public:
    variable_entry2 *get_splitting_entry(ir_variable *var);
 
    exec_list *variable_list;
-   void *mem_ctx;
 };
 
 variable_entry2 *
@@ -297,6 +309,8 @@ ir_structure_splitting_visitor::visit_leave(ir_assignment *ir)
    return visit_continue;
 }
 
+} /* unnamed namespace */
+
 bool
 do_structure_splitting(exec_list *instructions)
 {
@@ -322,7 +336,7 @@ do_structure_splitting(exec_list *instructions)
    if (refs.variable_list.is_empty())
       return false;
 
-   void *mem_ctx = hieralloc_new(NULL);
+   void *mem_ctx = ralloc_context(NULL);
 
    /* Replace the decls of the structures to be split with their split
     * components.
@@ -331,14 +345,14 @@ do_structure_splitting(exec_list *instructions)
       variable_entry2 *entry = (variable_entry2 *)iter.get();
       const struct glsl_type *type = entry->var->type;
 
-      entry->mem_ctx = hieralloc_parent(entry->var);
+      entry->mem_ctx = ralloc_parent(entry->var);
 
-      entry->components = hieralloc_array(mem_ctx,
+      entry->components = ralloc_array(mem_ctx,
 				       ir_variable *,
 				       type->length);
 
       for (unsigned int i = 0; i < entry->var->type->length; i++) {
-	 const char *name = hieralloc_asprintf(mem_ctx, "%s_%s",
+	 const char *name = ralloc_asprintf(mem_ctx, "%s_%s",
 					    entry->var->name,
 					    type->fields.structure[i].name);
 
@@ -355,7 +369,7 @@ do_structure_splitting(exec_list *instructions)
    ir_structure_splitting_visitor split(&refs.variable_list);
    visit_list_elements(&split, instructions);
 
-   hieralloc_free(mem_ctx);
+   ralloc_free(mem_ctx);
 
    return true;
 }

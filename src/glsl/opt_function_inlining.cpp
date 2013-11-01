@@ -27,7 +27,6 @@
  * Replaces calls to functions with the body of the function.
  */
 
-#include <inttypes.h>
 #include "ir.h"
 #include "ir_visitor.h"
 #include "ir_function_inlining.h"
@@ -39,6 +38,8 @@ static void
 do_sampler_replacement(exec_list *instructions,
 		       ir_variable *sampler,
 		       ir_dereference *deref);
+
+namespace {
 
 class ir_function_inlining_visitor : public ir_hierarchical_visitor {
 public:
@@ -54,7 +55,6 @@ public:
 
    virtual ir_visitor_status visit_enter(ir_expression *);
    virtual ir_visitor_status visit_enter(ir_call *);
-   virtual ir_visitor_status visit_enter(ir_assignment *);
    virtual ir_visitor_status visit_enter(ir_return *);
    virtual ir_visitor_status visit_enter(ir_texture *);
    virtual ir_visitor_status visit_enter(ir_swizzle *);
@@ -62,24 +62,12 @@ public:
    bool progress;
 };
 
-
-bool
-automatic_inlining_predicate(ir_instruction *ir)
-{
-   ir_call *call = ir->as_call();
-
-   if (call && can_inline(call))
-      return true;
-
-   return false;
-}
+} /* unnamed namespace */
 
 bool
 do_function_inlining(exec_list *instructions)
 {
    ir_function_inlining_visitor v;
-
-   do_expression_flattening(instructions, automatic_inlining_predicate);
 
    v.run(instructions);
 
@@ -89,13 +77,13 @@ do_function_inlining(exec_list *instructions)
 static void
 replace_return_with_assignment(ir_instruction *ir, void *data)
 {
-   void *ctx = hieralloc_parent(ir);
-   ir_variable *retval = (ir_variable *)data;
+   void *ctx = ralloc_parent(ir);
+   ir_dereference *orig_deref = (ir_dereference *) data;
    ir_return *ret = ir->as_return();
 
    if (ret) {
       if (ret->value) {
-	 ir_rvalue *lhs = new(ctx) ir_dereference_variable(retval);
+	 ir_rvalue *lhs = orig_deref->clone(ctx, NULL);
 	 ret->replace_with(new(ctx) ir_assignment(lhs, ret->value, NULL));
       } else {
 	 /* un-valued return has to be the last return, or we shouldn't
@@ -107,14 +95,13 @@ replace_return_with_assignment(ir_instruction *ir, void *data)
    }
 }
 
-ir_rvalue *
+void
 ir_call::generate_inline(ir_instruction *next_ir)
 {
-   void *ctx = hieralloc_parent(this);
+   void *ctx = ralloc_parent(this);
    ir_variable **parameters;
    int num_parameters;
    int i;
-   ir_variable *retval = NULL;
    struct hash_table *ht;
 
    ht = hash_table_ctor(0, hash_table_pointer_hash, hash_table_pointer_compare);
@@ -124,13 +111,6 @@ ir_call::generate_inline(ir_instruction *next_ir)
       num_parameters++;
 
    parameters = new ir_variable *[num_parameters];
-
-   /* Generate storage for the return value. */
-   if (this->callee->return_type) {
-      retval = new(ctx) ir_variable(this->callee->return_type, "_ret_val",
-				    ir_var_auto);
-      next_ir->insert_before(retval);
-   }
 
    /* Generate the declarations for the parameters to our inlined code,
     * and set up the mapping of real function body variables to ours.
@@ -165,6 +145,7 @@ ir_call::generate_inline(ir_instruction *next_ir)
 
       /* Move the actual param into our param variable if it's an 'in' type. */
       if (parameters[i] && (sig_param->mode == ir_var_in ||
+			    sig_param->mode == ir_var_const_in ||
 			    sig_param->mode == ir_var_inout)) {
 	 ir_assignment *assign;
 
@@ -185,7 +166,7 @@ ir_call::generate_inline(ir_instruction *next_ir)
       ir_instruction *new_ir = ir->clone(ctx, ht);
 
       new_instructions.push_tail(new_ir);
-      visit_tree(new_ir, replace_return_with_assignment, retval);
+      visit_tree(new_ir, replace_return_with_assignment, this->return_deref);
    }
 
    /* If any samplers were passed in, replace any deref of the sampler
@@ -208,10 +189,7 @@ ir_call::generate_inline(ir_instruction *next_ir)
    }
 
    /* Now push those new instructions in. */
-   foreach_iter(exec_list_iterator, iter, new_instructions) {
-      ir_instruction *ir = (ir_instruction *)iter.get();
-      next_ir->insert_before(ir);
-   }
+   next_ir->insert_before(&new_instructions);
 
    /* Copy back the value of any 'out' parameters from the function body
     * variables to our own.
@@ -241,11 +219,6 @@ ir_call::generate_inline(ir_instruction *next_ir)
    delete [] parameters;
 
    hash_table_dtor(ht);
-
-   if (retval)
-      return new(ctx) ir_dereference_variable(retval);
-   else
-      return NULL;
 }
 
 
@@ -285,13 +258,7 @@ ir_visitor_status
 ir_function_inlining_visitor::visit_enter(ir_call *ir)
 {
    if (can_inline(ir)) {
-      /* If the call was part of some tree, then it should have been
-       * flattened out or we shouldn't have seen it because of a
-       * visit_continue_with_parent in this visitor.
-       */
-      assert(ir == base_ir);
-
-      (void) ir->generate_inline(ir);
+      ir->generate_inline(ir);
       ir->remove();
       this->progress = true;
    }
@@ -299,25 +266,6 @@ ir_function_inlining_visitor::visit_enter(ir_call *ir)
    return visit_continue;
 }
 
-
-ir_visitor_status
-ir_function_inlining_visitor::visit_enter(ir_assignment *ir)
-{
-   ir_call *call = ir->rhs->as_call();
-   if (!call || !can_inline(call))
-      return visit_continue;
-
-   /* generates the parameter setup, function body, and returns the return
-    * value of the function
-    */
-   ir_rvalue *rhs = call->generate_inline(ir);
-   assert(rhs);
-
-   ir->rhs = rhs;
-   this->progress = true;
-
-   return visit_continue;
-}
 
 /**
  * Replaces references to the "sampler" variable with a clone of "deref."
@@ -357,7 +305,7 @@ ir_sampler_replacement_visitor::replace_deref(ir_dereference **deref)
 {
    ir_dereference_variable *deref_var = (*deref)->as_dereference_variable();
    if (deref_var && deref_var->var == this->sampler) {
-      *deref = this->deref->clone(hieralloc_parent(*deref), NULL);
+      *deref = this->deref->clone(ralloc_parent(*deref), NULL);
    }
 }
 

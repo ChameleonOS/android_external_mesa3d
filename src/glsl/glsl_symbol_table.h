@@ -44,38 +44,37 @@ class symbol_table_entry;
  */
 struct glsl_symbol_table {
 private:
-   static int
+   static void
    _glsl_symbol_table_destructor (glsl_symbol_table *table)
    {
       table->~glsl_symbol_table();
-
-      return 0;
    }
 
 public:
-   /* Callers of this hieralloc-based new need not call delete. It's
-    * easier to just hieralloc_free 'ctx' (or any of its ancestors). */
+   /* Callers of this ralloc-based new need not call delete. It's
+    * easier to just ralloc_free 'ctx' (or any of its ancestors). */
    static void* operator new(size_t size, void *ctx)
    {
       void *table;
 
-      table = hieralloc_size(ctx, size);
+      table = ralloc_size(ctx, size);
       assert(table != NULL);
 
-      hieralloc_set_destructor(table, (int (*)(void*)) _glsl_symbol_table_destructor);
+      ralloc_set_destructor(table, (void (*)(void*)) _glsl_symbol_table_destructor);
+
       return table;
    }
 
    /* If the user *does* call delete, that's OK, we will just
-    * hieralloc_free in that case. Here, C++ will have already called the
-    * destructor so tell hieralloc not to do that again. */
+    * ralloc_free in that case. Here, C++ will have already called the
+    * destructor so tell ralloc not to do that again. */
    static void operator delete(void *table)
    {
-      hieralloc_set_destructor(table, NULL);
-      hieralloc_free(table);
+      ralloc_set_destructor(table, NULL);
+      ralloc_free(table);
    }
    
-   glsl_symbol_table(void * mem_ctx);
+   glsl_symbol_table();
    ~glsl_symbol_table();
 
    unsigned int language_version;
@@ -99,6 +98,7 @@ public:
    bool add_variable(ir_variable *v);
    bool add_type(const char *name, const glsl_type *t);
    bool add_function(ir_function *f);
+   bool add_uniform_block(struct gl_uniform_block *u);
    /*@}*/
 
    /**

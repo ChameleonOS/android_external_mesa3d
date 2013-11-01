@@ -37,14 +37,15 @@ loop_state::loop_state()
 {
    this->ht = hash_table_ctor(0, hash_table_pointer_hash,
 			      hash_table_pointer_compare);
-   this->mem_ctx = hieralloc_init("loop state");
+   this->mem_ctx = ralloc_context(NULL);
+   this->loop_found = false;
 }
 
 
 loop_state::~loop_state()
 {
    hash_table_dtor(this->ht);
-   hieralloc_free(this->mem_ctx);
+   ralloc_free(this->mem_ctx);
 }
 
 
@@ -52,7 +53,9 @@ loop_variable_state *
 loop_state::insert(ir_loop *ir)
 {
    loop_variable_state *ls = new(this->mem_ctx) loop_variable_state;
+
    hash_table_insert(this->ht, ls, ir);
+   this->loop_found = true;
 
    return ls;
 }
@@ -75,8 +78,8 @@ loop_variable_state::get(const ir_variable *ir)
 loop_variable *
 loop_variable_state::insert(ir_variable *var)
 {
-   void *mem_ctx = hieralloc_parent(this);
-   loop_variable *lv = hieralloc_zero(mem_ctx, loop_variable);
+   void *mem_ctx = ralloc_parent(this);
+   loop_variable *lv = rzalloc(mem_ctx, loop_variable);
 
    lv->var = var;
 
@@ -90,8 +93,8 @@ loop_variable_state::insert(ir_variable *var)
 loop_terminator *
 loop_variable_state::insert(ir_if *if_stmt)
 {
-   void *mem_ctx = hieralloc_parent(this);
-   loop_terminator *t = hieralloc_zero(mem_ctx, loop_terminator);
+   void *mem_ctx = ralloc_parent(this);
+   loop_terminator *t = rzalloc(mem_ctx, loop_terminator);
 
    t->ir = if_stmt;
    this->terminators.push_tail(t);
@@ -106,6 +109,8 @@ public:
 
    virtual ir_visitor_status visit(ir_loop_jump *);
    virtual ir_visitor_status visit(ir_dereference_variable *);
+
+   virtual ir_visitor_status visit_enter(ir_call *);
 
    virtual ir_visitor_status visit_enter(ir_loop *);
    virtual ir_visitor_status visit_leave(ir_loop *);
@@ -146,6 +151,21 @@ loop_analysis::visit(ir_loop_jump *ir)
    ls->num_loop_jumps++;
 
    return visit_continue;
+}
+
+
+ir_visitor_status
+loop_analysis::visit_enter(ir_call *ir)
+{
+   /* If we're not somewhere inside a loop, there's nothing to do. */
+   if (this->state.is_empty())
+      return visit_continue;
+
+   loop_variable_state *const ls =
+      (loop_variable_state *) this->state.get_head();
+
+   ls->contains_calls = true;
+   return visit_continue_with_parent;
 }
 
 
@@ -206,6 +226,17 @@ loop_analysis::visit_leave(ir_loop *ir)
    loop_variable_state *const ls =
       (loop_variable_state *) this->state.pop_head();
 
+   /* Function calls may contain side effects.  These could alter any of our
+    * variables in ways that cannot be known, and may even terminate shader
+    * execution (say, calling discard in the fragment shader).  So we can't
+    * rely on any of our analysis about assignments to variables.
+    *
+    * We could perform some conservative analysis (prove there's no statically
+    * possible assignment, etc.) but it isn't worth it for now; function
+    * inlining will allow us to unroll loops anyway.
+    */
+   if (ls->contains_calls)
+      return visit_continue;
 
    foreach_list(node, &ir->body_instructions) {
       /* Skip over declarations at the start of a loop.
@@ -447,7 +478,7 @@ get_basic_induction_increment(ir_assignment *ir, hash_table *var_hash)
    }
 
    if ((inc != NULL) && (rhs->operation == ir_binop_sub)) {
-      void *mem_ctx = hieralloc_parent(ir);
+      void *mem_ctx = ralloc_parent(ir);
 
       inc = new(mem_ctx) ir_expression(ir_unop_neg,
 				       inc->type,

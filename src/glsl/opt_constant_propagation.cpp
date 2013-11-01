@@ -41,6 +41,8 @@
 #include "ir_optimization.h"
 #include "glsl_types.h"
 
+namespace {
+
 class acp_entry : public exec_node
 {
 public:
@@ -51,11 +53,23 @@ public:
       this->var = var;
       this->write_mask = write_mask;
       this->constant = constant;
+      this->initial_values = write_mask;
+   }
+
+   acp_entry(const acp_entry *src)
+   {
+      this->var = src->var;
+      this->write_mask = src->write_mask;
+      this->constant = src->constant;
+      this->initial_values = src->initial_values;
    }
 
    ir_variable *var;
    ir_constant *constant;
    unsigned write_mask;
+
+   /** Mask of values initially available in the constant. */
+   unsigned initial_values;
 };
 
 
@@ -78,13 +92,14 @@ public:
    ir_constant_propagation_visitor()
    {
       progress = false;
-      mem_ctx = hieralloc_new(0);
+      killed_all = false;
+      mem_ctx = ralloc_context(0);
       this->acp = new(mem_ctx) exec_list;
       this->kills = new(mem_ctx) exec_list;
    }
    ~ir_constant_propagation_visitor()
    {
-      hieralloc_free(mem_ctx);
+      ralloc_free(mem_ctx);
    }
 
    virtual ir_visitor_status visit_enter(class ir_loop *);
@@ -172,7 +187,7 @@ ir_constant_propagation_visitor::handle_rvalue(ir_rvalue **rvalue)
       for (int j = 0; j < 4; j++) {
 	 if (j == channel)
 	    break;
-	 if (found->write_mask & (1 << j))
+	 if (found->initial_values & (1 << j))
 	    rhs_channel++;
       }
 
@@ -195,7 +210,7 @@ ir_constant_propagation_visitor::handle_rvalue(ir_rvalue **rvalue)
       }
    }
 
-   *rvalue = new(hieralloc_parent(deref)) ir_constant(type, &data);
+   *rvalue = new(ralloc_parent(deref)) ir_constant(type, &data);
    this->progress = true;
 }
 
@@ -229,7 +244,26 @@ ir_constant_propagation_visitor::visit_leave(ir_assignment *ir)
    if (this->in_assignee)
       return visit_continue;
 
-   kill(ir->lhs->variable_referenced(), ir->write_mask);
+   unsigned kill_mask = ir->write_mask;
+   if (ir->lhs->as_dereference_array()) {
+      /* The LHS of the assignment uses an array indexing operator (e.g. v[i]
+       * = ...;).  Since we only try to constant propagate vectors and
+       * scalars, this means that either (a) array indexing is being used to
+       * select a vector component, or (b) the variable in question is neither
+       * a scalar or a vector, so we don't care about it.  In the former case,
+       * we want to kill the whole vector, since in general we can't predict
+       * which vector component will be selected by array indexing.  In the
+       * latter case, it doesn't matter what we do, so go ahead and kill the
+       * whole variable anyway.
+       *
+       * Note that if the array index is constant (e.g. v[2] = ...;), we could
+       * in principle be smarter, but we don't need to, because a future
+       * optimization pass will convert it to a simple assignment with the
+       * correct mask.
+       */
+      kill_mask = ~0;
+   }
+   kill(ir->lhs->variable_referenced(), kill_mask);
 
    add_constant(ir);
 
@@ -247,7 +281,7 @@ ir_visitor_status
 ir_constant_propagation_visitor::visit_enter(ir_call *ir)
 {
    /* Do constant propagation on call parameters, but skip any out params */
-   exec_list_iterator sig_param_iter = ir->get_callee()->parameters.iterator();
+   exec_list_iterator sig_param_iter = ir->callee->parameters.iterator();
    foreach_iter(exec_list_iterator, iter, ir->actual_parameters) {
       ir_variable *sig_param = (ir_variable *)sig_param_iter.get();
       ir_rvalue *param = (ir_rvalue *)iter.get();
@@ -285,8 +319,7 @@ ir_constant_propagation_visitor::handle_if_block(exec_list *instructions)
    /* Populate the initial acp with a constant of the original */
    foreach_iter(exec_list_iterator, iter, *orig_acp) {
       acp_entry *a = (acp_entry *)iter.get();
-      this->acp->push_tail(new(this->mem_ctx) acp_entry(a->var, a->write_mask,
-							a->constant));
+      this->acp->push_tail(new(this->mem_ctx) acp_entry(a));
    }
 
    visit_list_elements(this, instructions);
@@ -398,11 +431,8 @@ ir_constant_propagation_visitor::add_constant(ir_assignment *ir)
 {
    acp_entry *entry;
 
-   if (ir->condition) {
-      ir_constant *condition = ir->condition->as_constant();
-      if (!condition || !condition->value.b[0])
-	 return;
-   }
+   if (ir->condition)
+      return;
 
    if (!ir->write_mask)
       return;
@@ -422,6 +452,8 @@ ir_constant_propagation_visitor::add_constant(ir_assignment *ir)
    entry = new(this->mem_ctx) acp_entry(deref->var, ir->write_mask, constant);
    this->acp->push_tail(entry);
 }
+
+} /* unnamed namespace */
 
 /**
  * Does a constant propagation pass on the code present in the instruction stream.

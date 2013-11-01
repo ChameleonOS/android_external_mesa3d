@@ -44,6 +44,7 @@ public:
     * the hierarchy should not have \c visit methods.
     */
    /*@{*/
+   virtual void visit(class ir_rvalue *) { assert(!"unhandled error_type"); }
    virtual void visit(class ir_variable *) = 0;
    virtual void visit(class ir_function_signature *) = 0;
    virtual void visit(class ir_function *) = 0;
@@ -69,7 +70,6 @@ public:
  */
 class ir_control_flow_visitor : public ir_visitor {
 public:
-   using ir_visitor::visit;
    virtual void visit(class ir_variable *) {}
    virtual void visit(class ir_expression *) {}
    virtual void visit(class ir_texture *) {}

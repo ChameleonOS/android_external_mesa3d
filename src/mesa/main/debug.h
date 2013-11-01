@@ -64,6 +64,9 @@ extern void _mesa_init_debug( struct gl_context *ctx );
 #endif
 
 extern void
+_mesa_write_renderbuffer_image(const struct gl_renderbuffer *rb);
+
+extern void
 _mesa_dump_texture(GLuint texture, GLuint writeImages);
 
 extern void
@@ -82,6 +85,10 @@ extern void
 _mesa_dump_stencil_buffer(const char *filename);
 
 extern void
-_mesa_print_texture(struct gl_context *ctx, const struct gl_texture_image *img);
+_mesa_dump_image(const char *filename, const void *image, GLuint w, GLuint h,
+                 GLenum format, GLenum type);
+
+extern void
+_mesa_print_texture(struct gl_context *ctx, struct gl_texture_image *img);
 
 #endif

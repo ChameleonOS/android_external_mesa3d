@@ -1,27 +1,51 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
+from __future__ import with_statement
+
 import re
+import sys
 from glob import glob
 from os import path
 from subprocess import Popen, PIPE
+from sys import argv
 
 # Local module: generator for texture lookup builtins
 from texture_builtins import generate_texture_functions
 
 builtins_dir = path.join(path.dirname(path.abspath(__file__)), "..")
 
+# Get the path to the standalone GLSL compiler
+if len(argv) != 2:
+    print "Usage:", argv[0], "<path to compiler>"
+    sys.exit(1)
+
+compiler = argv[1]
+
 # Read the files in builtins/ir/*...add them to the supplied dictionary.
 def read_ir_files(fs):
-    for filename in glob(path.join(path.join(builtins_dir, 'ir'), '*')):
+    for filename in glob(path.join(path.join(builtins_dir, 'ir'), '*.ir')):
+        function_name = path.basename(filename).split('.')[0]
         with open(filename) as f:
-            fs[path.basename(filename)] = f.read()
+            fs[function_name] = f.read()
+
+def read_glsl_files(fs):
+    for filename in glob(path.join(path.join(builtins_dir, 'glsl'), '*.glsl')):
+        function_name = path.basename(filename).split('.')[0]
+        (output, returncode) = run_compiler([filename])
+        if (returncode):
+            sys.stderr.write("Failed to compile builtin: " + filename + "\n")
+            sys.stderr.write("Result:\n")
+            sys.stderr.write(output)
+        else:
+            fs[function_name] = output;
 
 # Return a dictionary containing all builtin definitions (even generated)
 def get_builtin_definitions():
     fs = {}
     generate_texture_functions(fs)
     read_ir_files(fs)
+    read_glsl_files(fs)
     return fs
 
 def stringify(s):
@@ -47,17 +71,28 @@ def write_function_definitions():
         print stringify(v), ';'
 
 def run_compiler(args):
-    compiler_path = path.join(path.join(builtins_dir, '..'), 'glsl_compiler')
-    command = [compiler_path, '--dump-lir'] + args
+    command = [compiler, '--dump-hir'] + args
     p = Popen(command, 1, stdout=PIPE, shell=False)
     output = p.communicate()[0]
 
+    if (p.returncode):
+        sys.stderr.write("Failed to compile builtins with command:\n")
+        for arg in command:
+            sys.stderr.write(arg + " ")
+        sys.stderr.write("\n")
+        sys.stderr.write("Result:\n")
+        sys.stderr.write(output)
+
     # Clean up output a bit by killing whitespace before a closing paren.
-    kill_paren_whitespace = re.compile(r'[ \n]*\)', re.MULTILINE);
-    output = kill_paren_whitespace.sub(')', output);
+    kill_paren_whitespace = re.compile(r'[ \n]*\)', re.MULTILINE)
+    output = kill_paren_whitespace.sub(')', output)
 
     # Also toss any duplicate newlines
     output = output.replace('\n\n', '\n')
+
+    # Kill any global variable declarations.  We don't want them.
+    kill_globals = re.compile(r'^\(declare.*\n', re.MULTILINE)
+    output = kill_globals.sub('', output)
 
     return (output, p.returncode)
 
@@ -67,14 +102,6 @@ def write_profile(filename, profile):
     if returncode != 0:
         print '#error builtins profile', profile, 'failed to compile'
         return
-
-    # Kill any global variable declarations.  We don't want them.
-    kill_globals = re.compile(r'^\(declare.*\n', re.MULTILINE);
-    proto_ir = kill_globals.sub('', proto_ir)
-
-    # Kill pointer addresses.  They're not necessary in prototypes and just
-    # clutter the diff output.
-    proto_ir = re.sub(r'@0x[0-9a-f]+', '', proto_ir);
 
     print 'static const char prototypes_for_' + profile + '[] ='
     print stringify(proto_ir), ';'
@@ -97,8 +124,13 @@ def write_profiles():
         write_profile(filename, profile)
 
 def get_profile_list():
+    profile_files = []
+    for extension in ['glsl', 'frag', 'vert']:
+        path_glob = path.join(
+            path.join(builtins_dir, 'profiles'), '*.' + extension)
+        profile_files.extend(glob(path_glob))
     profiles = []
-    for pfile in sorted(glob(path.join(path.join(builtins_dir, 'profiles'), '*'))):
+    for pfile in sorted(profile_files):
         profiles.append((pfile, path.basename(pfile).replace('.', '_')))
     return profiles
 
@@ -128,25 +160,33 @@ if __name__ == "__main__":
  */
 
 #include <stdio.h>
-#include "main/shaderobj.h" /* for struct gl_shader */
+#include "main/core.h" /* for struct gl_shader */
 #include "glsl_parser_extras.h"
 #include "ir_reader.h"
 #include "program.h"
 #include "ast.h"
 
+extern "C" struct gl_shader *
+_mesa_new_shader(struct gl_context *ctx, GLuint name, GLenum type);
+
 gl_shader *
-read_builtins(void * mem_ctx, GLenum target, const char *protos, const char **functions, unsigned count)
+read_builtins(GLenum target, const char *protos, const char **functions, unsigned count)
 {
    struct gl_context fakeCtx;
    fakeCtx.API = API_OPENGL;
-   gl_shader *sh = _mesa_new_shader(mem_ctx, 0, target);
+   fakeCtx.Const.GLSLVersion = 140;
+   fakeCtx.Extensions.ARB_ES2_compatibility = true;
+   fakeCtx.Const.ForceGLSLExtensionsWarn = false;
+   gl_shader *sh = _mesa_new_shader(NULL, 0, target);
    struct _mesa_glsl_parse_state *st =
       new(sh) _mesa_glsl_parse_state(&fakeCtx, target, sh);
 
-   st->language_version = 130;
-   st->symbols->language_version = 130;
+   st->language_version = 140;
+   st->symbols->language_version = 140;
    st->ARB_texture_rectangle_enable = true;
    st->EXT_texture_array_enable = true;
+   st->OES_EGL_image_external_enable = true;
+   st->ARB_shader_bit_encoding_enable = true;
    _mesa_glsl_initialize_types(st);
 
    sh->ir = new(sh) exec_list;
@@ -165,7 +205,7 @@ read_builtins(void * mem_ctx, GLenum target, const char *protos, const char **fu
       if (st->error) {
          printf("error reading builtin: %.35s ...\\n", functions[i]);
          printf("Info log:\\n%s\\n", st->info_log);
-         _mesa_delete_shader(NULL, sh);
+         ralloc_free(sh);
          return NULL;
       }
    }
@@ -190,14 +230,13 @@ void *builtin_mem_ctx = NULL;
 void
 _mesa_glsl_release_functions(void)
 {
-   hieralloc_free(builtin_mem_ctx);
+   ralloc_free(builtin_mem_ctx);
    builtin_mem_ctx = NULL;
    memset(builtin_profiles, 0, sizeof(builtin_profiles));
 }
 
 static void
 _mesa_read_profile(struct _mesa_glsl_parse_state *state,
-		   exec_list *instructions,
                    int profile_index,
 		   const char *prototypes,
 		   const char **functions,
@@ -206,8 +245,8 @@ _mesa_read_profile(struct _mesa_glsl_parse_state *state,
    gl_shader *sh = builtin_profiles[profile_index];
 
    if (sh == NULL) {
-      sh = read_builtins(state, GL_VERTEX_SHADER, prototypes, functions, count);
-      hieralloc_steal(builtin_mem_ctx, sh);
+      sh = read_builtins(GL_VERTEX_SHADER, prototypes, functions, count);
+      ralloc_steal(builtin_mem_ctx, sh);
       builtin_profiles[profile_index] = sh;
    }
 
@@ -216,32 +255,35 @@ _mesa_read_profile(struct _mesa_glsl_parse_state *state,
 }
 
 void
-_mesa_glsl_initialize_functions(exec_list *instructions,
-                                struct _mesa_glsl_parse_state *state)
+_mesa_glsl_initialize_functions(struct _mesa_glsl_parse_state *state)
 {
+   /* If we've already initialized the built-ins, bail early. */
+   if (state->num_builtins_to_link > 0)
+      return;
+
    if (builtin_mem_ctx == NULL) {
-      builtin_mem_ctx = hieralloc_init("GLSL built-in functions");
+      builtin_mem_ctx = ralloc_context(NULL); // "GLSL built-in functions"
       memset(&builtin_profiles, 0, sizeof(builtin_profiles));
    }
-
-   state->num_builtins_to_link = 0;
 """
 
-    i=0
+    i = 0
     for (filename, profile) in profiles:
         if profile.endswith('_vert'):
             check = 'state->target == vertex_shader && '
         elif profile.endswith('_frag'):
             check = 'state->target == fragment_shader && '
+        else:
+            check = ''
 
-        version = re.sub(r'_(vert|frag)$', '', profile)
+        version = re.sub(r'_(glsl|vert|frag)$', '', profile)
         if version.isdigit():
             check += 'state->language_version == ' + version
         else: # an extension name
             check += 'state->' + version + '_enable'
 
         print '   if (' + check + ') {'
-        print '      _mesa_read_profile(state, instructions, %d,' % i
+        print '      _mesa_read_profile(state, %d,' % i
         print '                         prototypes_for_' + profile + ','
         print '                         functions_for_' + profile + ','
         print '                         Elements(functions_for_' + profile + '));'
